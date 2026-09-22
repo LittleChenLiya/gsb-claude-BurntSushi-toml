@@ -23,6 +23,8 @@ type parser struct {
 	keyInfo   map[string]keyInfo  // Map keyname → info about the TOML key.
 	mapping   map[string]any      // Map keyname → key value.
 	implicits map[string]struct{} // Record implicit keys (e.g. "key.group.names").
+
+	doc *docCollector // Non-nil only when parsing for ParseDocument.
 }
 
 type keyInfo struct {
@@ -31,6 +33,10 @@ type keyInfo struct {
 }
 
 func parse(data string, maxDepth int) (p *parser, err error) {
+	return parseCollect(data, maxDepth, nil)
+}
+
+func parseCollect(data string, maxDepth int, doc *docCollector) (p *parser, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if pErr, ok := r.(ParseError); ok {
@@ -70,6 +76,7 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 		mapping:   make(map[string]any),
 		ordered:   make([]Key, 0),
 		implicits: make(map[string]struct{}),
+		doc:       doc,
 	}
 	for {
 		item := p.next()
@@ -205,6 +212,9 @@ func (p *parser) topLevel(item item) {
 		val, typ := p.value(vItem, false)
 		p.setValue(p.currentKey, val)
 		p.setType(p.currentKey, typ, vItem.pos)
+		if p.doc != nil && typ != tomlArray && typ != tomlHash {
+			p.doc.scalars[p.docKey(p.currentKey)] = docTokenRange(p.lx.input, vItem)
+		}
 
 		/// Remove the context we added (preserving any context from [tbl] lines).
 		p.context = outerContext
@@ -402,6 +412,18 @@ func (p *parser) valueArray(it item) (any, tomlType) {
 
 	p.setType(p.currentKey, tomlArray, it.pos)
 
+	// Record array element positions for ParseDocument, but only for the
+	// outermost array of this key; nested arrays record their own elements
+	// under the same key, which would misalign the indices.
+	docKey, docRecord := "", false
+	if p.doc != nil {
+		docKey = p.docKey(p.currentKey)
+		if _, ok := p.doc.arrays[docKey]; !ok {
+			p.doc.arrays[docKey] = nil
+			docRecord = true
+		}
+	}
+
 	var (
 		// Initialize to a non-nil slice to make it consistent with how S = []
 		// decodes into a non-nil slice inside something like struct { S
@@ -412,6 +434,10 @@ func (p *parser) valueArray(it item) (any, tomlType) {
 		if it.typ == itemCommentStart {
 			p.expect(itemText)
 			continue
+		}
+
+		if docRecord {
+			p.doc.arrays[docKey] = append(p.doc.arrays[docKey], docTokenRange(p.lx.input, it))
 		}
 
 		val, typ := p.value(it, true)
@@ -468,9 +494,13 @@ func (p *parser) valueInlineTable(it item, parentIsArray bool) (any, tomlType) {
 		p.ordered = append(p.ordered, p.context.add(p.currentKey))
 
 		/// Set the value.
-		val, typ := p.value(p.next(), false)
+		vItem := p.next()
+		val, typ := p.value(vItem, false)
 		p.setValue(p.currentKey, val)
 		p.setType(p.currentKey, typ, it.pos)
+		if p.doc != nil && typ != tomlArray && typ != tomlHash {
+			p.doc.scalars[p.docKey(p.currentKey)] = docTokenRange(p.lx.input, vItem)
+		}
 
 		hash := topHash
 		for _, c := range context {
@@ -599,6 +629,9 @@ func (p *parser) addContext(key Key, array bool) {
 		// for something else.
 		if hash, ok := hashContext[k].([]map[string]any); ok {
 			hashContext[k] = append(hash, make(map[string]any))
+			if p.doc != nil {
+				p.doc.arrIdx[key.String()] = len(hash)
+			}
 		} else {
 			p.panicf("Key '%s' was already created and cannot be used as an array.", key)
 		}

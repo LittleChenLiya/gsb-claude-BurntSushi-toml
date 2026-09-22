@@ -1,0 +1,28 @@
+# Server configuration
+title = "web \"tier\""   # keep this comment
+
+"quoted.dotted.key" = "old value"
+
+description = """
+Line one.
+Line "two" with quotes.
+"""
+
+max_connections = 0xDEADBEEF
+ratio = 0.5
+enabled = true
+
+ports = [8000, 8001, 8002]  # inline comment
+
+[limits]
+cpu = 4
+
+[[servers]]
+host = "alpha"
+port = 8001
+tags = ["a", "b"]
+
+[[servers]]  # second server
+host = "beta"
+port = 8002
+meta = {role = "backup", retries = 3}
