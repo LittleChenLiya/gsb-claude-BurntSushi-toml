@@ -1,6 +1,7 @@
 package toml
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
@@ -19,6 +20,11 @@ type parser struct {
 	currentKey string   // Base key name for everything except hashes.
 	pos        Position // Current position in the TOML file.
 
+	limits  ResourceLimits // Optional resource quotas; zero value = all off.
+	ctx     context.Context
+	nAssign int64 // Number of key/value assignments seen so far.
+	nArr    int64 // Number of array elements seen so far.
+
 	ordered   []Key               // List of keys in the order that they appear in the TOML data.
 	keyInfo   map[string]keyInfo  // Map keyname → info about the TOML key.
 	mapping   map[string]any      // Map keyname → key value.
@@ -30,7 +36,7 @@ type keyInfo struct {
 	tomlType tomlType
 }
 
-func parse(data string, maxDepth int) (p *parser, err error) {
+func parse(data string, maxDepth int, limits ResourceLimits, ctx context.Context) (p *parser, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			if pErr, ok := r.(ParseError); ok {
@@ -63,15 +69,21 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 		}
 	}
 
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	p = &parser{
 		lx:        lex(data),
 		maxDepth:  maxDepth,
+		limits:    limits,
+		ctx:       ctx,
 		keyInfo:   make(map[string]keyInfo),
 		mapping:   make(map[string]any),
 		ordered:   make([]Key, 0),
 		implicits: make(map[string]struct{}),
 	}
 	for {
+		p.checkCtx()
 		item := p.next()
 		if item.typ == itemEOF {
 			break
@@ -80,6 +92,103 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 	}
 
 	return p, nil
+}
+
+// checkCtx aborts parsing when the decoder's context has been cancelled. The
+// context error is wrapped in a ParseError so that errors.Is(err,
+// context.Canceled) (or context.DeadlineExceeded) still matches.
+func (p *parser) checkCtx() {
+	if err := p.ctx.Err(); err != nil {
+		panic(ParseError{
+			Message:  err.Error(),
+			err:      err,
+			Position: p.pos.withCol(p.lx.input),
+			Line:     p.pos.Line,
+			LastKey:  p.current(),
+		})
+	}
+}
+
+// panicResource reports an exceeded resource limit at pos. The
+// ResourceLimitError is wrapped in a ParseError so it carries the full
+// position information and can be retrieved with errors.As.
+func (p *parser) panicResource(name string, limit int64, pos Position) {
+	pos = p.positionAt(pos.Start)
+	rErr := ResourceLimitError{Name: name, Limit: limit, Line: pos.Line, Col: pos.Col}
+	panic(ParseError{
+		Message:  rErr.Error(),
+		err:      rErr,
+		Position: pos,
+		Line:     pos.Line,
+		LastKey:  p.current(),
+	})
+}
+
+// positionAt computes the exact 1-based line and column for a byte offset
+// in the input.
+func (p *parser) positionAt(start int) Position {
+	return Position{
+		Line:  1 + strings.Count(p.lx.input[:start], "\n"),
+		Col:   start - strings.LastIndex(p.lx.input[:start], "\n"),
+		Start: start,
+		Len:   1,
+	}
+}
+
+// countAssignment records one "key = value" assignment at pos and panics if
+// MaxKeyAssignments is exceeded. Table headers are not assignments and are
+// not counted here.
+func (p *parser) countAssignment(pos Position) {
+	if p.limits.MaxKeyAssignments <= 0 {
+		return
+	}
+	p.nAssign++
+	if p.nAssign > p.limits.MaxKeyAssignments {
+		p.panicResource("MaxKeyAssignments", p.limits.MaxKeyAssignments, pos)
+	}
+}
+
+// countArrayElement records one array element at pos and panics if
+// MaxArrayElements is exceeded.
+func (p *parser) countArrayElement(pos Position) {
+	if p.limits.MaxArrayElements <= 0 {
+		return
+	}
+	p.nArr++
+	if p.nArr > p.limits.MaxArrayElements {
+		p.panicResource("MaxArrayElements", p.limits.MaxArrayElements, pos)
+	}
+}
+
+// checkStringToken enforces MaxStringBytes on a decoded string s that is a
+// substring of the source, starting at byte offset off within the token
+// it.val (e.g. after a stripped first newline). The reported position is the
+// first byte beyond the limit.
+func (p *parser) checkStringToken(it item, s string, off int) {
+	if p.limits.MaxStringBytes <= 0 || int64(len(s)) <= p.limits.MaxStringBytes {
+		return
+	}
+	start := it.pos.Start + off + int(p.limits.MaxStringBytes)
+	p.panicResource("MaxStringBytes", p.limits.MaxStringBytes, Position{
+		Start: start,
+		Len:   1,
+	})
+}
+
+// checkStringLen enforces MaxStringBytes while a decoded string of n bytes is
+// being built. srcIdx is the byte index within the string's source token
+// corresponding to the content just written, or -1 if it cannot be mapped
+// back to the source (e.g. for multiline strings after whitespace trimming).
+func (p *parser) checkStringLen(it item, n int, srcIdx int) {
+	if p.limits.MaxStringBytes <= 0 || int64(n) <= p.limits.MaxStringBytes {
+		return
+	}
+	pos := it.pos
+	pos.Len = 1
+	if srcIdx >= 0 {
+		pos.Start = it.pos.Start + srcIdx
+	}
+	p.panicResource("MaxStringBytes", p.limits.MaxStringBytes, pos)
 }
 
 func (p *parser) panicErr(it item, err error) {
@@ -179,6 +288,8 @@ func (p *parser) topLevel(item item) {
 		p.addContext(key, true)
 		p.setType("", tomlArrayHash, item.pos)
 		p.ordered = append(p.ordered, key)
+		// Every [[array-of-tables]] entry counts as one array element.
+		p.countArrayElement(item.pos)
 	case itemKeyStart: // key = ..
 		outerContext := p.context
 		/// Read all the key parts (e.g. 'a' and 'b' in 'a.b')
@@ -202,6 +313,7 @@ func (p *parser) topLevel(item item) {
 
 		/// Set value.
 		vItem := p.next()
+		p.countAssignment(vItem.pos)
 		val, typ := p.value(vItem, false)
 		p.setValue(p.currentKey, val)
 		p.setType(p.currentKey, typ, vItem.pos)
@@ -239,15 +351,19 @@ var datetimeRepl = strings.NewReplacer(
 func (p *parser) value(it item, parentIsArray bool) (any, tomlType) {
 	switch it.typ {
 	case itemString:
+		p.checkStringToken(it, it.val, 0)
 		return it.val, p.typeOfPrimitive(it)
 	case itemStringEsc:
-		return p.replaceEscapes(it, it.val), p.typeOfPrimitive(it)
+		return p.replaceEscapes(it, it.val, true), p.typeOfPrimitive(it)
 	case itemMultilineString:
-		return p.replaceEscapes(it, p.stripEscapedNewlines(stripFirstNewline(it.val))), p.typeOfPrimitive(it)
+		return p.replaceEscapes(it, p.stripEscapedNewlines(it, stripFirstNewline(it.val)), false), p.typeOfPrimitive(it)
 	case itemRawString:
+		p.checkStringToken(it, it.val, 0)
 		return it.val, p.typeOfPrimitive(it)
 	case itemRawMultilineString:
-		return stripFirstNewline(it.val), p.typeOfPrimitive(it)
+		s := stripFirstNewline(it.val)
+		p.checkStringToken(it, s, len(it.val)-len(s))
+		return s, p.typeOfPrimitive(it)
 	case itemInteger:
 		return p.valueInteger(it)
 	case itemFloat:
@@ -413,7 +529,10 @@ func (p *parser) valueArray(it item) (any, tomlType) {
 			p.expect(itemText)
 			continue
 		}
-
+		p.checkCtx()
+		// Every element counts towards MaxArrayElements, including nested
+		// containers, which count as a single element of this array.
+		p.countArrayElement(it.pos)
 		val, typ := p.value(it, true)
 		array = append(array, val)
 
@@ -447,6 +566,7 @@ func (p *parser) valueInlineTable(it item, parentIsArray bool) (any, tomlType) {
 			p.expect(itemText)
 			continue
 		}
+		p.checkCtx()
 
 		/// Read all key parts.
 		k := p.nextPos()
@@ -468,7 +588,9 @@ func (p *parser) valueInlineTable(it item, parentIsArray bool) (any, tomlType) {
 		p.ordered = append(p.ordered, p.context.add(p.currentKey))
 
 		/// Set the value.
-		val, typ := p.value(p.next(), false)
+		vItem := p.next()
+		p.countAssignment(vItem.pos)
+		val, typ := p.value(vItem, false)
 		p.setValue(p.currentKey, val)
 		p.setType(p.currentKey, typ, it.pos)
 
@@ -723,7 +845,7 @@ func stripFirstNewline(s string) string {
 // A line-ending backslash is an unescaped \ followed only by whitespace until
 // the next newline. After a line-ending backslash, all whitespace is removed
 // until the next non-whitespace character.
-func (p *parser) stripEscapedNewlines(s string) string {
+func (p *parser) stripEscapedNewlines(it item, s string) string {
 	var (
 		b strings.Builder
 		i int
@@ -733,6 +855,7 @@ func (p *parser) stripEscapedNewlines(s string) string {
 		ix := strings.Index(s[i:], `\`)
 		if ix < 0 {
 			b.WriteString(s)
+			p.checkStringLen(it, b.Len(), -1)
 			return b.String()
 		}
 		i += ix
@@ -764,12 +887,18 @@ func (p *parser) stripEscapedNewlines(s string) string {
 			continue
 		}
 		b.WriteString(s[:i])
+		p.checkStringLen(it, b.Len(), -1)
 		s = s[j:]
 		i = 0
 	}
 }
 
-func (p *parser) replaceEscapes(it item, str string) string {
+// replaceEscapes expands escape sequences in str. If srcMap is true then str
+// is a substring of the input starting at it.pos.Start, so byte indices map
+// directly to source positions; otherwise positions fall back to the start
+// of the token. MaxStringBytes is enforced as the decoded string is built,
+// so no decoded string larger than the limit is ever constructed.
+func (p *parser) replaceEscapes(it item, str string, srcMap bool) string {
 	var (
 		b    strings.Builder
 		skip = 0
@@ -782,6 +911,7 @@ func (p *parser) replaceEscapes(it item, str string) string {
 		}
 		if c != '\\' {
 			b.WriteRune(c)
+			p.checkStringLen(it, b.Len(), mapSrc(srcMap, i))
 			continue
 		}
 
@@ -833,8 +963,19 @@ func (p *parser) replaceEscapes(it item, str string) string {
 			b.WriteRune(escaped)
 			skip = 9
 		}
+		p.checkStringLen(it, b.Len(), mapSrc(srcMap, i))
 	}
 	return b.String()
+}
+
+// mapSrc maps a byte index within a string token to a source byte offset
+// relative to the token start, or -1 if the string no longer corresponds to
+// the source (e.g. a multiline string after whitespace trimming).
+func mapSrc(srcMap bool, i int) int {
+	if !srcMap {
+		return -1
+	}
+	return i
 }
 
 func (p *parser) asciiEscapeToUnicode(it item, s string) rune {

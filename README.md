@@ -116,5 +116,24 @@ func decode() {
 To target TOML specifically you can implement the `UnmarshalTOML` interface in
 a similar way.
 
+### Resource limits
+Decoding untrusted documents can be constrained with optional resource limits,
+which are all disabled by default:
+
+```go
+dec := toml.NewDecoder(r)
+err := dec.SetResourceLimits(toml.ResourceLimits{
+	MaxInputBytes:     1 << 20, // Raw bytes read from r.
+	MaxKeyAssignments: 10_000,  // "key = value" pairs; [table] headers don't count.
+	MaxStringBytes:    1 << 20, // UTF-8 bytes of a single decoded string.
+	MaxArrayElements:  100_000, // Total elements of all arrays.
+})
+```
+
+Limits are enforced while reading and parsing: decoding stops at the first
+position beyond a limit, no further data is read, and the decode target is
+left unmodified. A value exactly equal to a limit is still valid. See the
+[ResourceLimits] documentation for the exact counting rules.
+
 ### More complex usage
 See the [`_example/`](/_example) directory for a more complex example.

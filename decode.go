@@ -2,6 +2,7 @@ package toml
 
 import (
 	"bytes"
+	"context"
 	"encoding"
 	"encoding/json"
 	"fmt"
@@ -120,6 +121,8 @@ const (
 type Decoder struct {
 	r        io.Reader
 	maxDepth int
+	limits   ResourceLimits
+	ctx      context.Context
 }
 
 // NewDecoder creates a new Decoder.
@@ -132,6 +135,35 @@ func NewDecoder(r io.Reader) *Decoder {
 //
 // The default is 128. Set to <=0 to disable the limit.
 func (dec *Decoder) MaxDepth(l int) { dec.maxDepth = l }
+
+// SetResourceLimits sets optional resource quotas for this decoder. All
+// limits are disabled by default; see [ResourceLimits] for the exact counting
+// rules of each limit.
+//
+// Limits are enforced while reading and parsing the input: decoding stops at
+// the first position beyond a limit and the value passed to [Decoder.Decode]
+// is left unmodified. If several limits (including [Decoder.MaxDepth]) would
+// be exceeded, whichever is encountered first is reported.
+//
+// Negative limits are rejected with an error.
+func (dec *Decoder) SetResourceLimits(l ResourceLimits) error {
+	if err := l.validate(); err != nil {
+		return err
+	}
+	dec.limits = l
+	return nil
+}
+
+// SetContext sets the context used while reading and parsing the input.
+// Decoding stops promptly when the context is cancelled: no further Read
+// calls are made on the underlying reader and the returned error matches the
+// context error (e.g. errors.Is(err, context.Canceled)).
+func (dec *Decoder) SetContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dec.ctx = ctx
+}
 
 var (
 	unmarshalToml = reflect.TypeOf((*Unmarshaler)(nil)).Elem()
@@ -164,14 +196,12 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		return MetaData{}, fmt.Errorf("toml: cannot decode to type %s", rt)
 	}
 
-	// TODO: parser should read from io.Reader? Or at the very least, make it
-	// read from []byte rather than string
-	data, err := io.ReadAll(dec.r)
+	data, err := dec.readInput()
 	if err != nil {
 		return MetaData{}, err
 	}
 
-	p, err := parse(string(data), dec.maxDepth)
+	p, err := parse(string(data), dec.maxDepth, dec.limits, dec.ctx)
 	if err != nil {
 		return MetaData{}, err
 	}

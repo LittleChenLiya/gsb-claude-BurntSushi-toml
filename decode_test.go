@@ -1184,7 +1184,7 @@ func BenchmarkEscapes(b *testing.B) {
 	str := strings.Repeat("hello, world!\n", 10)
 	b.ResetTimer()
 	for n := 0; n < b.N; n++ {
-		p.replaceEscapes(it, str)
+		p.replaceEscapes(it, str, false)
 	}
 }
 
