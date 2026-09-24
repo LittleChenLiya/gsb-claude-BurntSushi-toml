@@ -116,5 +116,51 @@ func decode() {
 To target TOML specifically you can implement the `UnmarshalTOML` interface in
 a similar way.
 
+### Resource limits
+`Decoder` offers a set of optional resource limits to guard against
+pathological or hostile input. All of them are disabled by default (a limit of
+`0`), so existing `Decode` calls behave exactly as before; negative values are
+rejected with an error:
+
+```go
+dec := toml.NewDecoder(r)
+dec.MaxInputBytes(1 << 20)  // raw input bytes
+dec.MaxKeyAssignments(1000) // "key = value" assignments
+dec.MaxStringBytes(1 << 16) // decoded size of a single string
+dec.MaxArrayElements(10000) // total array elements
+_, err := dec.Decode(&conf)
+```
+
+The limits are defined as follows:
+
+- `MaxInputBytes` counts the raw TOML bytes consumed from the reader (a
+  leading BOM is not counted).
+- `MaxKeyAssignments` counts every `key = value` assignment, including
+  assignments inside inline tables; table headers (`[table]`,
+  `[[array-of-tables]]`) are not assignments and are not counted.
+- `MaxStringBytes` counts the UTF-8 bytes of each decoded string: for basic
+  strings after escape expansion, and for multiline strings after the
+  whitespace the TOML spec strips (the first newline and whitespace after
+  line-ending backslashes) has been removed.
+- `MaxArrayElements` counts every element of every `[ ... ]` array in the
+  document; a nested array or inline table counts as one element of its parent
+  array (its own contents are counted separately), and every
+  `[[array-of-tables]]` entry counts as one element.
+
+A value exactly equal to the limit is accepted; the first position beyond the
+limit is reported as a `toml.LimitError` (wrapping the limit name and limit
+value) inside a `toml.ParseError` with the line and column. Limits are
+enforced while lexing and parsing: the input is read incrementally in bounded
+chunks (never more than 32 KiB per `Read` call), oversized decoded strings are
+never allocated, and reading stops as soon as a limit is exceeded. When a
+limit is exceeded the decode target is left completely untouched. If both
+`MaxDepth` and a resource limit apply, whichever is hit first in the document
+is reported.
+
+`DecodeContext` additionally stops decoding when a `context.Context` is
+cancelled; errors from the underlying reader and from context cancellation
+are returned wrapped with `%w`, so they stay identifiable with
+`errors.Is`/`errors.As`.
+
 ### More complex usage
 See the [`_example/`](/_example) directory for a more complex example.

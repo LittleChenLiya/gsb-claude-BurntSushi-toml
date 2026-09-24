@@ -2,6 +2,7 @@ package toml
 
 import (
 	"bytes"
+	"context"
 	"encoding"
 	"encoding/json"
 	"fmt"
@@ -120,6 +121,7 @@ const (
 type Decoder struct {
 	r        io.Reader
 	maxDepth int
+	lim      limits
 }
 
 // NewDecoder creates a new Decoder.
@@ -133,6 +135,69 @@ func NewDecoder(r io.Reader) *Decoder {
 // The default is 128. Set to <=0 to disable the limit.
 func (dec *Decoder) MaxDepth(l int) { dec.maxDepth = l }
 
+// MaxInputBytes sets the maximum number of raw TOML input bytes that may be
+// consumed from the underlying reader. A leading BOM is not counted. Reading
+// stops and a [LimitError] is returned as soon as a byte beyond the limit
+// would be consumed; exactly limit bytes is still accepted.
+//
+// The default of 0 disables the limit. Negative values are rejected with an
+// error and leave the previous setting unchanged.
+func (dec *Decoder) MaxInputBytes(n int64) error {
+	if n < 0 {
+		return fmt.Errorf("toml: MaxInputBytes cannot be negative: %d", n)
+	}
+	dec.lim.maxInputBytes = n
+	return nil
+}
+
+// MaxKeyAssignments sets the maximum number of "key = value" assignments in
+// the document, including assignments inside inline tables. Table headers
+// ([table] and [[array-of-tables]]) are not assignments and are not counted.
+// The (limit+1)-th assignment fails with a [LimitError].
+//
+// The default of 0 disables the limit. Negative values are rejected with an
+// error and leave the previous setting unchanged.
+func (dec *Decoder) MaxKeyAssignments(n int) error {
+	if n < 0 {
+		return fmt.Errorf("toml: MaxKeyAssignments cannot be negative: %d", n)
+	}
+	dec.lim.maxKeyAssign = n
+	return nil
+}
+
+// MaxStringBytes sets the maximum size in UTF-8 bytes of any single decoded
+// string. For basic strings the content is counted after escape expansion;
+// for multiline strings the whitespace the TOML spec strips (the first
+// newline and whitespace after line-ending backslashes) is removed before
+// counting. A string whose decoded content is one byte longer fails with a
+// [LimitError]; the oversized decoded string is never allocated.
+//
+// The default of 0 disables the limit. Negative values are rejected with an
+// error and leave the previous setting unchanged.
+func (dec *Decoder) MaxStringBytes(n int) error {
+	if n < 0 {
+		return fmt.Errorf("toml: MaxStringBytes cannot be negative: %d", n)
+	}
+	dec.lim.maxString = n
+	return nil
+}
+
+// MaxArrayElements sets the maximum total number of array elements in the
+// document. Every value in a [ ... ] array counts as one element, including
+// nested arrays and inline tables (whose own contents are in turn counted
+// separately), and every [[array-of-tables]] entry counts as one element.
+// The (limit+1)-th element fails with a [LimitError].
+//
+// The default of 0 disables the limit. Negative values are rejected with an
+// error and leave the previous setting unchanged.
+func (dec *Decoder) MaxArrayElements(n int) error {
+	if n < 0 {
+		return fmt.Errorf("toml: MaxArrayElements cannot be negative: %d", n)
+	}
+	dec.lim.maxArrayElem = n
+	return nil
+}
+
 var (
 	unmarshalToml = reflect.TypeOf((*Unmarshaler)(nil)).Elem()
 	unmarshalText = reflect.TypeOf((*encoding.TextUnmarshaler)(nil)).Elem()
@@ -141,6 +206,19 @@ var (
 
 // Decode TOML data in to the pointer `v`.
 func (dec *Decoder) Decode(v any) (MetaData, error) {
+	return dec.DecodeContext(context.Background(), v)
+}
+
+// DecodeContext is like [Decoder.Decode], but stops reading and returns an
+// error when ctx is cancelled. The returned error unwraps to the context
+// error, so errors.Is(err, context.Canceled) works.
+//
+// Errors from the underlying reader are likewise returned wrapping the
+// original error, keeping them identifiable with errors.Is/As.
+func (dec *Decoder) DecodeContext(ctx context.Context, v any) (MetaData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer {
 		s := "%q"
@@ -164,14 +242,7 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		return MetaData{}, fmt.Errorf("toml: cannot decode to type %s", rt)
 	}
 
-	// TODO: parser should read from io.Reader? Or at the very least, make it
-	// read from []byte rather than string
-	data, err := io.ReadAll(dec.r)
-	if err != nil {
-		return MetaData{}, err
-	}
-
-	p, err := parse(string(data), dec.maxDepth)
+	p, err := parse(ctx, dec.r, dec.maxDepth, dec.lim)
 	if err != nil {
 		return MetaData{}, err
 	}
@@ -182,7 +253,7 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		keys:    p.ordered,
 		decoded: make(map[string]struct{}, len(p.ordered)),
 		context: nil,
-		data:    data,
+		data:    p.lx.buf,
 	}
 	return md, md.unify(p.mapping, rv)
 }

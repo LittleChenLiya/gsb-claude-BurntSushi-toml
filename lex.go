@@ -1,7 +1,10 @@
 package toml
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"reflect"
 	"runtime"
 	"strings"
@@ -46,13 +49,20 @@ func (p Position) String() string {
 }
 
 type lexer struct {
-	input string
-	start int
-	pos   int
-	line  int
-	state stateFn
-	items chan item
-	esc   bool
+	r          io.Reader
+	ctx        context.Context
+	buf        []byte // All bytes read from r so far; indices match Position.Start.
+	eof        bool   // The underlying reader has returned io.EOF.
+	readErr    errRead
+	haveErr    bool // A read or limit error item has already been emitted.
+	emptyReads int
+	maxInput   int64
+	start      int
+	pos        int
+	line       int
+	state      stateFn
+	items      chan item
+	esc        bool
 
 	// Allow for backing up up to 4 runes. This is necessary because TOML
 	// contains 3-rune tokens (""" and ''').
@@ -88,15 +98,58 @@ func (lx *lexer) nextItem() item {
 	}
 }
 
-func lex(input string) *lexer {
+// maxReadChunk is the largest number of bytes requested from the underlying
+// reader in a single Read call.
+const maxReadChunk = 32 * 1024
+
+func lex(ctx context.Context, r io.Reader, maxInput int64) *lexer {
 	lx := &lexer{
-		input: input,
-		state: lexTop,
-		items: make(chan item, 10),
-		stack: make([]stateFn, 0, 10),
-		line:  1,
+		r:        r,
+		ctx:      ctx,
+		maxInput: maxInput,
+		state:    lexTop,
+		items:    make(chan item, 10),
+		stack:    make([]stateFn, 0, 10),
+		line:     1,
 	}
 	return lx
+}
+
+// fill requests at most maxReadChunk more bytes from the reader.
+func (lx *lexer) fill() {
+	if lx.eof || lx.haveErr || lx.readErr.err != nil {
+		return
+	}
+	if err := lx.ctx.Err(); err != nil {
+		lx.readErr = errRead{fmt.Errorf("toml: reading TOML input: %w", err)}
+		return
+	}
+	var tmp [maxReadChunk]byte
+	n, err := lx.r.Read(tmp[:])
+	if n > 0 {
+		lx.buf = append(lx.buf, tmp[:n]...)
+	}
+	switch {
+	case err == io.EOF:
+		lx.eof = true
+	case err != nil:
+		lx.readErr = errRead{fmt.Errorf("toml: reading TOML input: %w", err)}
+	case n == 0:
+		lx.emptyReads++
+		if lx.emptyReads > 100 {
+			lx.readErr = errRead{fmt.Errorf("toml: reading TOML input: %w", io.ErrNoProgress)}
+		}
+	default:
+		lx.emptyReads = 0
+	}
+}
+
+// fillN keeps reading until at least n bytes are buffered, the reader is
+// exhausted, or an error occurred.
+func (lx *lexer) fillN(n int) {
+	for len(lx.buf) < n && !lx.eof && !lx.haveErr && lx.readErr.err == nil {
+		lx.fill()
+	}
 }
 
 func (lx *lexer) push(state stateFn) {
@@ -113,7 +166,7 @@ func (lx *lexer) pop() stateFn {
 }
 
 func (lx *lexer) current() string {
-	return lx.input[lx.start:lx.pos]
+	return string(lx.buf[lx.start:lx.pos])
 }
 
 func (lx lexer) getPos() Position {
@@ -131,7 +184,7 @@ func (lx lexer) getPos() Position {
 func (lx *lexer) emit(typ itemType) {
 	// Needed for multiline strings ending with an incomplete UTF-8 sequence.
 	if lx.start > lx.pos {
-		lx.error(errLexUTF8{lx.input[lx.pos]})
+		lx.error(errLexUTF8{lx.buf[lx.pos]})
 		return
 	}
 	lx.items <- item{typ: typ, pos: lx.getPos(), val: lx.current()}
@@ -147,12 +200,44 @@ func (lx *lexer) next() (r rune) {
 	if lx.atEOF {
 		panic("BUG in lexer: next called after EOF")
 	}
-	if lx.pos >= len(lx.input) {
-		lx.atEOF = true
-		return eof
+
+	// First make sure there is a full rune (or EOF/an error) available.
+	for {
+		if lx.pos >= len(lx.buf) {
+			if lx.haveErr {
+				return utf8.RuneError
+			}
+			if lx.readErr.err != nil {
+				return lx.errorRead()
+			}
+			if lx.eof {
+				lx.atEOF = true
+				return eof
+			}
+			lx.fill()
+			continue
+		}
+
+		// MaxInputBytes: consuming the byte at offset maxInput would take the
+		// total over the limit, so error before advancing.
+		if lx.maxInput > 0 && int64(lx.pos) >= lx.maxInput {
+			return lx.errorLimit()
+		}
+
+		if utf8.FullRune(lx.buf[lx.pos:]) {
+			break
+		}
+		// The rune may be split across the next Read chunk.
+		if lx.readErr.err != nil {
+			return lx.errorRead()
+		}
+		if lx.eof {
+			break
+		}
+		lx.fill()
 	}
 
-	if lx.input[lx.pos] == '\n' {
+	if lx.buf[lx.pos] == '\n' {
 		lx.line++
 	}
 	lx.prevWidths[3] = lx.prevWidths[2]
@@ -162,14 +247,25 @@ func (lx *lexer) next() (r rune) {
 		lx.nprev++
 	}
 
-	r, w := utf8.DecodeRuneInString(lx.input[lx.pos:])
+	r, w := utf8.DecodeRune(lx.buf[lx.pos:])
 	if r == utf8.RuneError && w == 1 {
-		lx.error(errLexUTF8{lx.input[lx.pos]})
+		lx.error(errLexUTF8{lx.buf[lx.pos]})
 		return utf8.RuneError
 	}
 
+	// A lone CR needs one byte of lookahead; it may sit at the end of the
+	// current buffer while more data is coming.
+	if r == '\r' {
+		for lx.pos+1 >= len(lx.buf) && !lx.eof && !lx.haveErr && lx.readErr.err == nil {
+			lx.fill()
+		}
+		if lx.readErr.err != nil && lx.pos+1 >= len(lx.buf) {
+			return lx.errorRead()
+		}
+	}
+
 	// Note: don't use peek() here, as this calls next().
-	if isControl(r) || (r == '\r' && (len(lx.input)-1 == lx.pos || lx.input[lx.pos+1] != '\n')) {
+	if isControl(r) || (r == '\r' && (lx.pos+1 >= len(lx.buf) || lx.buf[lx.pos+1] != '\n')) {
 		lx.errorControlChar(r)
 		return utf8.RuneError
 	}
@@ -177,6 +273,32 @@ func (lx *lexer) next() (r rune) {
 	lx.prevWidths[0] = w
 	lx.pos += w
 	return r
+}
+
+// errorRead emits the pending reader/context error exactly once.
+func (lx *lexer) errorRead() rune {
+	if !lx.haveErr {
+		lx.haveErr = true
+		lx.items <- item{typ: itemError, pos: lx.getPos(), err: lx.readErr}
+	}
+	return utf8.RuneError
+}
+
+// errorLimit emits the MaxInputBytes error at the position of the first byte
+// that would exceed the limit.
+func (lx *lexer) errorLimit() rune {
+	if !lx.haveErr {
+		lx.haveErr = true
+		lim := int(lx.maxInput)
+		lx.items <- item{typ: itemError, err: LimitError{Name: "MaxInputBytes", Limit: lx.maxInput},
+			pos: Position{
+				Line:  1 + bytes.Count(lx.buf[:lim], []byte{'\n'}),
+				Start: lim,
+				Len:   1,
+			},
+		}
+	}
+	return utf8.RuneError
 }
 
 // ignore skips over the pending input before this point.
@@ -200,7 +322,7 @@ func (lx *lexer) backup() {
 	lx.nprev--
 
 	lx.pos -= w
-	if lx.pos < len(lx.input) && lx.input[lx.pos] == '\n' {
+	if lx.pos < len(lx.buf) && lx.buf[lx.pos] == '\n' {
 		lx.line--
 	}
 }
@@ -269,7 +391,7 @@ func (lx *lexer) errorPos(start, length int, err error) stateFn {
 func (lx *lexer) errorf(format string, values ...any) stateFn {
 	if lx.atEOF {
 		pos := lx.getPos()
-		if lx.pos >= 1 && lx.input[lx.pos-1] == '\n' {
+		if lx.pos >= 1 && lx.buf[lx.pos-1] == '\n' {
 			pos.Line--
 		}
 		pos.Len = 1

@@ -1,7 +1,11 @@
 package toml
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"fmt"
+	"io"
 	"math"
 	"strconv"
 	"strings"
@@ -14,6 +18,9 @@ import (
 type parser struct {
 	lx         *lexer
 	maxDepth   int
+	lim        limits
+	nKeys      int // Number of key assignments seen so far.
+	nArrayEl   int // Total number of array elements seen so far.
 	arrDepth   int
 	context    Key      // Full key for the current hash in scope.
 	currentKey string   // Base key name for everything except hashes.
@@ -30,42 +37,53 @@ type keyInfo struct {
 	tomlType tomlType
 }
 
-func parse(data string, maxDepth int) (p *parser, err error) {
+func parse(ctx context.Context, r io.Reader, maxDepth int, lim limits) (p *parser, err error) {
+	lx := lex(ctx, r, lim.maxInputBytes)
 	defer func() {
-		if r := recover(); r != nil {
-			if pErr, ok := r.(ParseError); ok {
-				pErr.input = data
-				err = pErr
-				return
+		if rec := recover(); rec != nil {
+			switch e := rec.(type) {
+			case ParseError:
+				e.input = string(lx.buf)
+				err = e
+			case errRead:
+				// Reader and context errors are returned as-is (wrapped
+				// with %w) so they stay identifiable with errors.Is/As.
+				err = e.err
+			default:
+				panic(rec)
 			}
-			panic(r)
 		}
 	}()
+
+	// Make sure the first few bytes are available for the BOM and NULL
+	// checks below.
+	lx.fillN(6)
 
 	// Read over BOM; do this here as the lexer calls utf8.DecodeRuneInString()
 	// which mangles stuff. UTF-16 BOM isn't strictly valid, but some tools add
 	// it anyway.
-	if strings.HasPrefix(data, "\xff\xfe") || strings.HasPrefix(data, "\xfe\xff") { // UTF-16
-		data = data[2:]
-	} else if strings.HasPrefix(data, "\xef\xbb\xbf") { // UTF-8
-		data = data[3:]
+	if bytes.HasPrefix(lx.buf, []byte("\xff\xfe")) || bytes.HasPrefix(lx.buf, []byte("\xfe\xff")) { // UTF-16
+		lx.buf = lx.buf[2:]
+	} else if bytes.HasPrefix(lx.buf, []byte("\xef\xbb\xbf")) { // UTF-8
+		lx.buf = lx.buf[3:]
 	}
 
 	// Examine first few bytes for NULL bytes; this probably means it's a UTF-16
 	// file (second byte in surrogate pair being NULL). Again, do this here to
 	// avoid having to deal with UTF-8/16 stuff in the lexer.
-	if i := strings.IndexRune(data[:min(len(data), 6)], 0); i > -1 {
+	if i := bytes.IndexByte(lx.buf[:min(len(lx.buf), 6)], 0); i > -1 {
 		return nil, ParseError{
 			Message:  "files cannot contain NULL bytes; probably using UTF-16; TOML files must be UTF-8",
 			Position: Position{Line: 1, Col: 1, Start: i, Len: 1},
 			Line:     1,
-			input:    data,
+			input:    string(lx.buf),
 		}
 	}
 
 	p = &parser{
-		lx:        lex(data),
+		lx:        lx,
 		maxDepth:  maxDepth,
+		lim:       lim,
 		keyInfo:   make(map[string]keyInfo),
 		mapping:   make(map[string]any),
 		ordered:   make([]Key, 0),
@@ -82,11 +100,14 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 	return p, nil
 }
 
+// input returns the input read so far; used for error positions.
+func (p *parser) input() string { return string(p.lx.buf) }
+
 func (p *parser) panicErr(it item, err error) {
 	panic(ParseError{
 		Message:  err.Error(),
 		err:      err,
-		Position: it.pos.withCol(p.lx.input),
+		Position: it.pos.withCol(p.input()),
 		Line:     it.pos.Len,
 		LastKey:  p.current(),
 	})
@@ -95,7 +116,7 @@ func (p *parser) panicErr(it item, err error) {
 func (p *parser) panicItemf(it item, format string, v ...any) {
 	panic(ParseError{
 		Message:  fmt.Sprintf(format, v...),
-		Position: it.pos.withCol(p.lx.input),
+		Position: it.pos.withCol(p.input()),
 		Line:     it.pos.Len,
 		LastKey:  p.current(),
 	})
@@ -104,7 +125,7 @@ func (p *parser) panicItemf(it item, format string, v ...any) {
 func (p *parser) panicf(format string, v ...any) {
 	panic(ParseError{
 		Message:  fmt.Sprintf(format, v...),
-		Position: p.pos.withCol(p.lx.input),
+		Position: p.pos.withCol(p.input()),
 		Line:     p.pos.Line,
 		LastKey:  p.current(),
 	})
@@ -115,10 +136,14 @@ func (p *parser) next() item {
 	//fmt.Printf("ITEM %-18s line %-3d │ %q\n", it.typ, it.pos.Line, it.val)
 	if it.typ == itemError {
 		if it.err != nil {
+			var readErr errRead
+			if errors.As(it.err, &readErr) {
+				panic(readErr)
+			}
 			panic(ParseError{
 				Message:  it.err.Error(),
 				err:      it.err,
-				Position: it.pos.withCol(p.lx.input),
+				Position: it.pos.withCol(p.input()),
 				Line:     it.pos.Line,
 				LastKey:  p.current(),
 			})
@@ -137,6 +162,32 @@ func (p *parser) nextPos() item {
 
 func (p *parser) bug(format string, v ...any) {
 	panic(fmt.Sprintf("BUG: "+format+"\n\n", v...))
+}
+
+// countKeyAssignment counts one key = value assignment and reports whether
+// the configured limit still permits it.
+func (p *parser) countKeyAssignment() bool {
+	p.nKeys++
+	return p.lim.maxKeyAssign <= 0 || p.nKeys <= p.lim.maxKeyAssign
+}
+
+// countArrayElem counts one array element and reports whether the configured
+// limit still permits it.
+func (p *parser) countArrayElem() bool {
+	p.nArrayEl++
+	return p.lim.maxArrayElem <= 0 || p.nArrayEl <= p.lim.maxArrayElem
+}
+
+// limitErr panics with a LimitError at the given item's position.
+func (p *parser) limitErr(it item, name string, limit int64) {
+	le := LimitError{Name: name, Limit: limit}
+	panic(ParseError{
+		Message:  le.Error(),
+		err:      le,
+		Position: it.pos.withCol(p.input()),
+		Line:     it.pos.Line,
+		LastKey:  p.current(),
+	})
 }
 
 func (p *parser) expect(typ itemType) item {
@@ -176,6 +227,11 @@ func (p *parser) topLevel(item item) {
 		}
 		p.assertEqual(itemArrayTableEnd, name.typ)
 
+		// Each array-of-tables header appends one element to its array.
+		if !p.countArrayElem() {
+			p.limitErr(item, "MaxArrayElements", int64(p.lim.maxArrayElem))
+		}
+
 		p.addContext(key, true)
 		p.setType("", tomlArrayHash, item.pos)
 		p.ordered = append(p.ordered, key)
@@ -188,6 +244,10 @@ func (p *parser) topLevel(item item) {
 			key = append(key, p.keyString(k))
 		}
 		p.assertEqual(itemKeyEnd, k.typ)
+
+		if !p.countKeyAssignment() {
+			p.limitErr(item, "MaxKeyAssignments", int64(p.lim.maxKeyAssign))
+		}
 
 		/// The current key is the last part.
 		p.currentKey = key.last()
@@ -239,14 +299,19 @@ var datetimeRepl = strings.NewReplacer(
 func (p *parser) value(it item, parentIsArray bool) (any, tomlType) {
 	switch it.typ {
 	case itemString:
+		p.checkStringLimit(it)
 		return it.val, p.typeOfPrimitive(it)
 	case itemStringEsc:
+		p.checkStringLimit(it)
 		return p.replaceEscapes(it, it.val), p.typeOfPrimitive(it)
 	case itemMultilineString:
+		p.checkStringLimit(it)
 		return p.replaceEscapes(it, p.stripEscapedNewlines(stripFirstNewline(it.val))), p.typeOfPrimitive(it)
 	case itemRawString:
+		p.checkStringLimit(it)
 		return it.val, p.typeOfPrimitive(it)
 	case itemRawMultilineString:
+		p.checkStringLimit(it)
 		return stripFirstNewline(it.val), p.typeOfPrimitive(it)
 	case itemInteger:
 		return p.valueInteger(it)
@@ -271,6 +336,32 @@ func (p *parser) value(it item, parentIsArray bool) (any, tomlType) {
 		p.bug("Unexpected value type: %s", it.typ)
 	}
 	panic("unreachable")
+}
+
+// checkStringLimit panics with a LimitError if the decoded content of the
+// string in it exceeds MaxStringBytes. The check runs before the decoded
+// string is constructed, so oversized strings are never allocated.
+func (p *parser) checkStringLimit(it item) {
+	if p.lim.maxString <= 0 {
+		return
+	}
+	off := stringExceedOffset(it, p.lim.maxString)
+	if off < 0 {
+		return
+	}
+	pos := it.pos
+	pos.Start += off
+	pos.Len = 1
+	in := p.input()
+	pos.Line = 1 + strings.Count(in[:pos.Start], "\n")
+	le := LimitError{Name: "MaxStringBytes", Limit: int64(p.lim.maxString)}
+	panic(ParseError{
+		Message:  le.Error(),
+		err:      le,
+		Position: pos.withCol(in),
+		Line:     pos.Line,
+		LastKey:  p.current(),
+	})
 }
 
 func (p *parser) valueInteger(it item) (any, tomlType) {
@@ -414,6 +505,9 @@ func (p *parser) valueArray(it item) (any, tomlType) {
 			continue
 		}
 
+		if !p.countArrayElem() {
+			p.limitErr(it, "MaxArrayElements", int64(p.lim.maxArrayElem))
+		}
 		val, typ := p.value(it, true)
 		array = append(array, val)
 
@@ -455,6 +549,10 @@ func (p *parser) valueInlineTable(it item, parentIsArray bool) (any, tomlType) {
 			key = append(key, p.keyString(k))
 		}
 		p.assertEqual(itemKeyEnd, k.typ)
+
+		if !p.countKeyAssignment() {
+			p.limitErr(it, "MaxKeyAssignments", int64(p.lim.maxKeyAssign))
+		}
 
 		/// The current key is the last part.
 		p.currentKey = key.last()
@@ -551,7 +649,7 @@ func (p *parser) addContext(key Key, array bool) {
 		// it's going to be a very long string and not very useful.
 		panic(ParseError{
 			Message:  fmt.Sprintf("exceeds maximum table depth of %d", p.maxDepth),
-			Position: p.pos.withCol(p.lx.input),
+			Position: p.pos.withCol(p.input()),
 			Line:     p.pos.Line,
 		})
 	}
