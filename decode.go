@@ -141,6 +141,20 @@ var (
 
 // Decode TOML data in to the pointer `v`.
 func (dec *Decoder) Decode(v any) (MetaData, error) {
+	return dec.decode(v, nil)
+}
+
+// DecodeWithMigrations decodes TOML data like [Decoder.Decode], but applies
+// the given key migrations to the parsed data before decoding it with the
+// regular decoding rules. The applied migrations are reported in
+// [MetaData.Migrations].
+//
+// See [KeyMigration] for the migration semantics and conflict rules.
+func (dec *Decoder) DecodeWithMigrations(v any, migrations ...KeyMigration) (MetaData, error) {
+	return dec.decode(v, migrations)
+}
+
+func (dec *Decoder) decode(v any, migrations []KeyMigration) (MetaData, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer {
 		s := "%q"
@@ -176,13 +190,23 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		return MetaData{}, err
 	}
 
+	var applied []MigrationRecord
+	if len(migrations) > 0 {
+		var err error
+		applied, err = applyMigrations(p, migrations, string(data))
+		if err != nil {
+			return MetaData{}, err
+		}
+	}
+
 	md := MetaData{
-		mapping: p.mapping,
-		keyInfo: p.keyInfo,
-		keys:    p.ordered,
-		decoded: make(map[string]struct{}, len(p.ordered)),
-		context: nil,
-		data:    data,
+		mapping:    p.mapping,
+		keyInfo:    p.keyInfo,
+		keys:       p.ordered,
+		decoded:    make(map[string]struct{}, len(p.ordered)),
+		context:    nil,
+		data:       data,
+		Migrations: applied,
 	}
 	return md, md.unify(p.mapping, rv)
 }

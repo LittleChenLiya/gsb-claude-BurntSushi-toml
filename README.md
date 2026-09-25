@@ -61,6 +61,38 @@ type TOML struct {
 Beware that like other decoders **only exported fields** are considered when
 encoding and decoding; private fields are silently ignored.
 
+### Key migration
+`DecodeWithMigrations` decodes while renaming keys on the fly: callers pass a
+list of `KeyMigration` values mapping old key paths to new ones, the keys are
+migrated in the parsed document, and the result is decoded with the regular
+decoding rules. Plain `Decode` never applies migrations.
+
+Paths are slices of key segments, so a literal quoted key such as
+`"a.b"` is a single segment and is never confused with a nested path. The
+special `toml.Wildcard` segment matches any single key, or every element of an
+array of tables, migrating each element individually:
+
+```go
+var conf Config
+md, err := toml.DecodeWithMigrations(tomlData, &conf,
+	toml.KeyMigration{
+		From: toml.Key{"server", "timeout"},
+		To:   toml.Key{"server", "read_timeout"},
+	},
+	// Migrate "timeout" in every element of the "servers" array of tables.
+	toml.KeyMigration{
+		From: toml.Key{"servers", toml.Wildcard, "timeout"},
+		To:   toml.Key{"servers", toml.Wildcard, "read_timeout"},
+	},
+)
+```
+
+Every applied migration is recorded in `md.Migrations` with the source
+position and target field. It is an error (never a silent overwrite) when the
+old and new key both exist, when migrations form a chain or cycle, or when the
+target path leads into a non-table value such as a scalar. The input document
+is never modified. See `_example/migrate/` for a runnable demonstration.
+
 ### Using the `Marshaler` and `encoding.TextUnmarshaler` interfaces
 Here's an example that automatically parses values in a `mail.Address`:
 

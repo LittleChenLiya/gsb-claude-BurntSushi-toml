@@ -17,6 +17,11 @@ type MetaData struct {
 	keys    []Key
 	decoded map[string]struct{}
 	data    []byte // Input file; for errors.
+
+	// Migrations lists the key migrations applied before decoding, in the
+	// order they were applied. It is empty unless the data was decoded with
+	// [DecodeWithMigrations] or [Decoder.DecodeWithMigrations].
+	Migrations []MigrationRecord
 }
 
 // IsDefined reports if the key exists in the TOML data.
