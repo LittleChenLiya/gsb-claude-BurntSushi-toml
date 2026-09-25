@@ -61,6 +61,16 @@ func (x byIndex) Less(i, j int) bool {
 // type. The algorithm is breadth-first search over the set of structs to
 // include - the top struct and then any reachable anonymous structs.
 func typeFields(t reflect.Type) []field {
+	fields, _ := typeFieldsConflicts(t)
+	return fields
+}
+
+// typeFieldsConflicts is like typeFields, but also returns the names of keys
+// that were dropped because of conflicting (ambiguous) fields: either
+// multiple fields with the same name at the same embedding depth, or multiple
+// tagged fields at the same depth. Decode ignores these keys in exactly the
+// same way, so the conflict list is consistent with the decode mapping.
+func typeFieldsConflicts(t reflect.Type) ([]field, []string) {
 	// Anonymous fields to explore at the current level and the next.
 	current := []field{}
 	next := []field{{typ: t}}
@@ -74,6 +84,9 @@ func typeFields(t reflect.Type) []field {
 
 	// Fields found.
 	var fields []field
+
+	// Keys dropped due to conflicting fields.
+	var conflicts []string
 
 	for len(next) > 0 {
 		current, next = next, current[:0]
@@ -160,13 +173,15 @@ func typeFields(t reflect.Type) []field {
 		dominant, ok := dominantField(fields[i : i+advance])
 		if ok {
 			out = append(out, dominant)
+		} else {
+			conflicts = append(conflicts, name)
 		}
 	}
 
 	fields = out
 	sort.Sort(byIndex(fields))
 
-	return fields
+	return fields, conflicts
 }
 
 // dominantField looks through the fields, all of which are known to
@@ -207,32 +222,52 @@ func dominantField(fields []field) (field, bool) {
 	return fields[0], true
 }
 
-var fieldCache struct {
-	sync.RWMutex
-	m map[reflect.Type][]field
+// cachedFields is the cached result of typeFieldsConflicts.
+type cachedFields struct {
+	fields    []field
+	conflicts []string
 }
 
-// cachedTypeFields is like typeFields but uses a cache to avoid repeated work.
-func cachedTypeFields(t reflect.Type) []field {
+var fieldCache struct {
+	sync.RWMutex
+	m map[reflect.Type]cachedFields
+}
+
+// getCachedTypeFields is like typeFieldsConflicts but uses a cache to avoid
+// repeated work.
+func getCachedTypeFields(t reflect.Type) cachedFields {
 	fieldCache.RLock()
 	f := fieldCache.m[t]
 	fieldCache.RUnlock()
-	if f != nil {
+	if f.fields != nil {
 		return f
 	}
 
 	// Compute fields without lock.
 	// Might duplicate effort but won't hold other computations back.
-	f = typeFields(t)
-	if f == nil {
-		f = []field{}
+	fields, conflicts := typeFieldsConflicts(t)
+	if fields == nil {
+		fields = []field{}
 	}
+	f = cachedFields{fields: fields, conflicts: conflicts}
 
 	fieldCache.Lock()
 	if fieldCache.m == nil {
-		fieldCache.m = map[reflect.Type][]field{}
+		fieldCache.m = map[reflect.Type]cachedFields{}
 	}
 	fieldCache.m[t] = f
 	fieldCache.Unlock()
 	return f
+}
+
+// cachedTypeFields is like typeFields but uses a cache to avoid repeated work.
+func cachedTypeFields(t reflect.Type) []field {
+	return getCachedTypeFields(t).fields
+}
+
+// cachedTypeFieldsConflicts is like typeFieldsConflicts but uses a cache to
+// avoid repeated work.
+func cachedTypeFieldsConflicts(t reflect.Type) ([]field, []string) {
+	c := getCachedTypeFields(t)
+	return c.fields, c.conflicts
 }
