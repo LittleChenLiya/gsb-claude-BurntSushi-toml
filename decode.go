@@ -141,6 +141,14 @@ var (
 
 // Decode TOML data in to the pointer `v`.
 func (dec *Decoder) Decode(v any) (MetaData, error) {
+	md, _, err := dec.decode(v, nil)
+	return md, err
+}
+
+// decode implements Decode and DecodeWithKeyMigrations; key migrations are
+// applied to the parsed data before decoding, and only when requested
+// through [Decoder.DecodeWithKeyMigrations].
+func (dec *Decoder) decode(v any, migrations []KeyMigration) (MetaData, []Migration, error) {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer {
 		s := "%q"
@@ -148,10 +156,10 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 			s = "%v"
 		}
 
-		return MetaData{}, fmt.Errorf("toml: cannot decode to non-pointer "+s, reflect.TypeOf(v))
+		return MetaData{}, nil, fmt.Errorf("toml: cannot decode to non-pointer "+s, reflect.TypeOf(v))
 	}
 	if rv.IsNil() {
-		return MetaData{}, fmt.Errorf("toml: cannot decode to nil value of %q", reflect.TypeOf(v))
+		return MetaData{}, nil, fmt.Errorf("toml: cannot decode to nil value of %q", reflect.TypeOf(v))
 	}
 
 	// Check if this is a supported type: struct, map, any, or something that
@@ -161,19 +169,43 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 	if rv.Kind() != reflect.Struct && rv.Kind() != reflect.Map &&
 		!(rv.Kind() == reflect.Interface && rv.NumMethod() == 0) &&
 		!rt.Implements(unmarshalToml) && !rt.Implements(unmarshalText) {
-		return MetaData{}, fmt.Errorf("toml: cannot decode to type %s", rt)
+		return MetaData{}, nil, fmt.Errorf("toml: cannot decode to type %s", rt)
 	}
 
 	// TODO: parser should read from io.Reader? Or at the very least, make it
 	// read from []byte rather than string
 	data, err := io.ReadAll(dec.r)
 	if err != nil {
-		return MetaData{}, err
+		return MetaData{}, nil, err
 	}
 
 	p, err := parse(string(data), dec.maxDepth)
 	if err != nil {
-		return MetaData{}, err
+		return MetaData{}, nil, err
+	}
+
+	var applied []Migration
+	if len(migrations) > 0 {
+		if err := validateKeyMigrations(migrations); err != nil {
+			return MetaData{}, nil, err
+		}
+		mg := &migrator{p: p, data: string(data)}
+		for _, m := range migrations {
+			am, err := mg.apply(m)
+			if err != nil {
+				return MetaData{}, nil, err
+			}
+			applied = append(applied, am...)
+		}
+		for i := range applied {
+			field, ok := resolveMigrationField(rv.Type(), applied[i].To)
+			if !ok {
+				return MetaData{}, nil, fmt.Errorf(
+					"toml: key migration target %q does not match any field in %s",
+					applied[i].To, rv.Type())
+			}
+			applied[i].Field = field
+		}
 	}
 
 	md := MetaData{
@@ -184,7 +216,7 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		context: nil,
 		data:    data,
 	}
-	return md, md.unify(p.mapping, rv)
+	return md, applied, md.unify(p.mapping, rv)
 }
 
 // PrimitiveDecode is just like the other Decode* functions, except it decodes a

@@ -116,5 +116,39 @@ func decode() {
 To target TOML specifically you can implement the `UnmarshalTOML` interface in
 a similar way.
 
+### Migrating renamed keys
+When a configuration key is renamed, `DecodeWithKeyMigrations` moves the old
+key to its new location before decoding, so old config files keep working with
+new structs:
+
+```go
+type Config struct {
+	Server struct {
+		ReadTimeout int `toml:"read_timeout"`
+	} `toml:"server"`
+}
+
+var conf Config
+_, migrations, err := toml.NewDecoder(strings.NewReader(tomlData)).DecodeWithKeyMigrations(
+	&conf,
+	toml.KeyMigration{
+		From: toml.Key{"server", "timeout"},      // old key
+		To:   toml.Key{"server", "read_timeout"}, // new key
+	},
+)
+```
+
+Paths are lists of key segments, so a quoted key that literally contains a dot
+(`"a.b"`) is a single segment and never confused with a nested path. A single
+`*` segment migrates every element of an array of tables individually, e.g.
+`toml.Key{"servers", "*", "timeout"}`.
+
+Every applied migration is returned with the source position and target struct
+field. Both keys existing at once, chained or cyclic migrations, and migrating
+into a scalar value are reported as errors rather than silently overwriting
+anything. The input is never modified, and the regular `Decode` functions
+don't apply any migrations. See [`_example/key-migration/`](/_example/key-migration)
+for a runnable demo.
+
 ### More complex usage
 See the [`_example/`](/_example) directory for a more complex example.

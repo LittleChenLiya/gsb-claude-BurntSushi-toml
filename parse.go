@@ -23,6 +23,12 @@ type parser struct {
 	keyInfo   map[string]keyInfo  // Map keyname → info about the TOML key.
 	mapping   map[string]any      // Map keyname → key value.
 	implicits map[string]struct{} // Record implicit keys (e.g. "key.group.names").
+
+	// Index-qualified key info for keys inside arrays of tables, e.g.
+	// "servers[1].timeout". keyInfo alone can't distinguish individual
+	// array elements; key migrations use this to report per-element
+	// positions.
+	arrayKeyInfo map[string]keyInfo
 }
 
 type keyInfo struct {
@@ -64,12 +70,13 @@ func parse(data string, maxDepth int) (p *parser, err error) {
 	}
 
 	p = &parser{
-		lx:        lex(data),
-		maxDepth:  maxDepth,
-		keyInfo:   make(map[string]keyInfo),
-		mapping:   make(map[string]any),
-		ordered:   make([]Key, 0),
-		implicits: make(map[string]struct{}),
+		lx:           lex(data),
+		maxDepth:     maxDepth,
+		keyInfo:      make(map[string]keyInfo),
+		mapping:      make(map[string]any),
+		ordered:      make([]Key, 0),
+		implicits:    make(map[string]struct{}),
+		arrayKeyInfo: make(map[string]keyInfo),
 	}
 	for {
 		item := p.next()
@@ -686,6 +693,43 @@ func (p *parser) setType(key string, typ tomlType, pos Position) {
 		keyContext = Key{""}
 	}
 	p.keyInfo[keyContext.String()] = keyInfo{tomlType: typ, pos: pos}
+
+	// Record an index-qualified key (e.g. "servers[1].timeout") for keys
+	// inside arrays of tables, so that key migrations can report positions
+	// for individual array elements.
+	var (
+		hash    any = p.mapping
+		indexed = make([]string, 0, len(keyContext))
+		inArray bool
+		failed  bool
+	)
+	for _, k := range p.context {
+		m, ok := hash.(map[string]any)
+		if !ok {
+			failed = true
+			break
+		}
+		switch t := m[k].(type) {
+		case []map[string]any:
+			indexed = append(indexed, fmt.Sprintf("%s[%d]", Key{k}.String(), len(t)-1))
+			hash = t[len(t)-1]
+			inArray = true
+		case map[string]any:
+			indexed = append(indexed, Key{k}.String())
+			hash = t
+		default:
+			failed = true
+		}
+		if failed {
+			break
+		}
+	}
+	if inArray && !failed {
+		if len(key) > 0 {
+			indexed = append(indexed, Key{key}.String())
+		}
+		p.arrayKeyInfo[strings.Join(indexed, ".")] = keyInfo{tomlType: typ, pos: pos}
+	}
 }
 
 // Implicit keys need to be created when tables are implied in "a.b.c.d = 1" and
