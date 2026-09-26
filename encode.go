@@ -130,6 +130,13 @@ type Encoder struct {
 	Indent     string // string for a single indentation level; default is two spaces.
 	hasWritten bool   // written any output to w yet?
 	w          *bufio.Writer
+
+	// Pre-computed results of Marshaler.MarshalTOML and
+	// encoding.TextMarshaler.MarshalText calls, keyed by the (comparable)
+	// value. Used by SafeEncoder so custom marshalers are only called once;
+	// nil for encoders created with NewEncoder, which always call the
+	// marshaler directly.
+	marshalCache map[any][]byte
 }
 
 // NewEncoder create a new Encoder.
@@ -229,6 +236,10 @@ func (enc *Encoder) eElement(rv reflect.Value) {
 		enc.write(v.Format(format))
 		return
 	case Marshaler:
+		if s, ok := enc.cachedMarshal(rv); ok {
+			enc.w.Write(s)
+			return
+		}
 		s, err := v.MarshalTOML()
 		if err != nil {
 			encPanic(err)
@@ -239,6 +250,10 @@ func (enc *Encoder) eElement(rv reflect.Value) {
 		enc.w.Write(s)
 		return
 	case encoding.TextMarshaler:
+		if s, ok := enc.cachedMarshal(rv); ok {
+			enc.writeQuoted(string(s))
+			return
+		}
 		s, err := v.MarshalText()
 		if err != nil {
 			encPanic(err)
@@ -751,6 +766,17 @@ func (enc *Encoder) indentStr(key Key) string {
 
 func encPanic(err error) {
 	panic(tomlEncodeError{err})
+}
+
+// cachedMarshal returns the pre-computed marshaler result for rv, if any.
+// Only SafeEncoder sets a cache; encoders created with NewEncoder always
+// return false here and call the marshaler directly.
+func (enc *Encoder) cachedMarshal(rv reflect.Value) ([]byte, bool) {
+	if enc.marshalCache == nil || !rv.Type().Comparable() {
+		return nil, false
+	}
+	s, ok := enc.marshalCache[rv.Interface()]
+	return s, ok
 }
 
 // Resolve any level of pointers to the actual value (e.g. **string → string).
