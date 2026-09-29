@@ -130,6 +130,11 @@ type Encoder struct {
 	Indent     string // string for a single indentation level; default is two spaces.
 	hasWritten bool   // written any output to w yet?
 	w          *bufio.Writer
+
+	// marshalCache caches MarshalTOML/MarshalText results, keyed by value
+	// identity. It is nil for regular encoders; SafeEncoder uses it to make
+	// sure every custom marshaler is called exactly once.
+	marshalCache map[marshalKey]marshalResult
 }
 
 // NewEncoder create a new Encoder.
@@ -229,7 +234,7 @@ func (enc *Encoder) eElement(rv reflect.Value) {
 		enc.write(v.Format(format))
 		return
 	case Marshaler:
-		s, err := v.MarshalTOML()
+		s, err := enc.marshalTOML(rv, v)
 		if err != nil {
 			encPanic(err)
 		}
@@ -239,7 +244,7 @@ func (enc *Encoder) eElement(rv reflect.Value) {
 		enc.w.Write(s)
 		return
 	case encoding.TextMarshaler:
-		s, err := v.MarshalText()
+		s, err := enc.marshalText(rv, v)
 		if err != nil {
 			encPanic(err)
 		}
