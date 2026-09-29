@@ -116,5 +116,30 @@ func decode() {
 To target TOML specifically you can implement the `UnmarshalTOML` interface in
 a similar way.
 
+
+### Exporting a configuration contract
+Editors and other tooling can derive a serializable contract of the
+configuration a Go type accepts with `DescribeType`, using the exact field
+resolution rules of `Decode` (toml tags, anonymous fields, nested pointers):
+
+```go
+contract, err := toml.DescribeType(Config{}, toml.DescribeConfig{
+	// Nothing is required by default; required keys are always explicit.
+	Required: []toml.Key{{"title"}},
+})
+```
+
+The contract contains object, table-array, scalar, map, and reference nodes
+in field declaration order. Recursive types are expressed as reference nodes
+with stable, address-free IDs instead of being expanded infinitely;
+`time.Time` (including local datetimes) is annotated as a `Datetime` scalar;
+types implementing `Unmarshaler` are marked opaque unless they provide a
+`TypeDescriber` callback, and their `UnmarshalTOML` is never called. Field
+conflicts are reported as diagnostics consistent with the decoder's mapping.
+
+Try it out (finishes in well under 90 seconds):
+
+    % go run github.com/BurntSushi/toml/cmd/tomlcontract@latest
+
 ### More complex usage
 See the [`_example/`](/_example) directory for a more complex example.

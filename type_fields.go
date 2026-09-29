@@ -9,6 +9,7 @@ package toml
 import (
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -61,6 +62,15 @@ func (x byIndex) Less(i, j int) bool {
 // type. The algorithm is breadth-first search over the set of structs to
 // include - the top struct and then any reachable anonymous structs.
 func typeFields(t reflect.Type) []field {
+	fields, _ := typeFieldsDiag(t)
+	return fields
+}
+
+// typeFieldsDiag is typeFields, but also reports the names that were dropped
+// because of conflicting fields at the same embedding level. This is exactly
+// the set of fields Decode will not map, so diagnostics built on this stay
+// consistent with the decoder.
+func typeFieldsDiag(t reflect.Type) ([]field, []FieldConflict) {
 	// Anonymous fields to explore at the current level and the next.
 	current := []field{}
 	next := []field{{typ: t}}
@@ -74,6 +84,9 @@ func typeFields(t reflect.Type) []field {
 
 	// Fields found.
 	var fields []field
+
+	// Names dropped due to conflicts.
+	var conflicts []FieldConflict
 
 	for len(next) > 0 {
 		current, next = next, current[:0]
@@ -160,13 +173,38 @@ func typeFields(t reflect.Type) []field {
 		dominant, ok := dominantField(fields[i : i+advance])
 		if ok {
 			out = append(out, dominant)
+		} else {
+			c := FieldConflict{Name: name}
+			for _, fj := range fields[i : i+advance] {
+				c.Fields = append(c.Fields, fieldPath(t, fj.index))
+			}
+			conflicts = append(conflicts, c)
 		}
 	}
 
 	fields = out
 	sort.Sort(byIndex(fields))
 
-	return fields
+	return fields, conflicts
+}
+
+// fieldPath renders a field index sequence as a dotted Go field path such as
+// "Config.Server.Host", for use in diagnostics.
+func fieldPath(t reflect.Type, index []int) string {
+	var b strings.Builder
+	typ := t
+	for i, x := range index {
+		if typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+		}
+		if i > 0 {
+			b.WriteByte('.')
+		}
+		sf := typ.Field(x)
+		b.WriteString(sf.Name)
+		typ = sf.Type
+	}
+	return b.String()
 }
 
 // dominantField looks through the fields, all of which are known to
