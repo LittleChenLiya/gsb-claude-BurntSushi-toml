@@ -354,6 +354,11 @@ var dtTypes = []struct {
 }
 
 func (p *parser) valueDatetime(it item) (any, tomlType) {
+	// Keep the original literal: the default mapping works off the parsed
+	// time.Time, but types that want to validate or format the value
+	// themselves (e.g. DateTime) need the raw text to preserve the offset and
+	// fractional-second precision.
+	raw := it.val
 	it.val = datetimeRepl.Replace(it.val)
 	var (
 		t   time.Time
@@ -373,7 +378,7 @@ func (p *parser) valueDatetime(it item) (any, tomlType) {
 	if !ok {
 		p.panicErr(it, errParseDate{it.val})
 	}
-	return t, p.typeOfPrimitive(it)
+	return internal.DatetimeValue{Raw: raw, T: t}, p.typeOfPrimitive(it)
 }
 
 // Go's time.Parse() will accept numbers without a leading zero; there isn't any

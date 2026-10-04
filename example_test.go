@@ -385,3 +385,37 @@ func Example_unmarshalTOML() {
 		fmt.Println(part.Name())
 	}
 }
+
+// DateTime is an explicit carrier for TOML date/time values. Unlike time.Time,
+// it distinguishes offset date-times, local date-times, local dates, and local
+// times, and it preserves the original offset and fractional-second precision.
+// Encoding selects the corresponding TOML native literal.
+func ExampleDateTime() {
+	offset := toml.DateTime{
+		Kind: toml.OffsetDateTime,
+		Year: 2020, Month: 1, Day: 2,
+		Hour: 3, Minute: 4, Second: 5,
+		Offset: 8 * 3600,
+	}
+	localDT := toml.DateTime{
+		Kind: toml.LocalDateTime,
+		Year: 2020, Month: 1, Day: 2,
+		Hour: 3, Minute: 4, Second: 5,
+	}
+	localD := toml.DateTime{Kind: toml.LocalDate, Year: 2020, Month: 1, Day: 2}
+	localT := toml.DateTime{
+		Kind: toml.LocalTime,
+		Hour: 3, Minute: 4, Second: 5,
+		Nanosecond: 120_000_000, Precision: 3,
+	}
+
+	for _, dt := range []toml.DateTime{offset, localDT, localD, localT} {
+		fmt.Println(dt.String())
+	}
+
+	// Output:
+	// 2020-01-02T03:04:05+08:00
+	// 2020-01-02T03:04:05
+	// 2020-01-02
+	// 03:04:05.120
+}

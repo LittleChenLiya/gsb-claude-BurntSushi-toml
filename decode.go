@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/BurntSushi/toml/internal"
 )
 
 // Unmarshaler is the interface implemented by objects that can unmarshal a
@@ -529,13 +531,48 @@ func (md *MetaData) unifyBool(data any, rv reflect.Value) error {
 }
 
 func (md *MetaData) unifyAnything(data any, rv reflect.Value) error {
-	rv.Set(reflect.ValueOf(data))
+	rv.Set(reflect.ValueOf(unwrapDatetimeValues(data)))
 	return nil
+}
+
+// unwrapDatetimeValues replaces internal.DatetimeValue values with their
+// parsed time.Time, so that decoding into interface{} keeps the default
+// time.Time mapping. The raw literal is only retained for types that ask for
+// it explicitly (e.g. DateTime).
+func unwrapDatetimeValues(v any) any {
+	switch vv := v.(type) {
+	case internal.DatetimeValue:
+		return vv.T
+	case map[string]any:
+		for k, val := range vv {
+			vv[k] = unwrapDatetimeValues(val)
+		}
+		return vv
+	case []any:
+		for i, val := range vv {
+			vv[i] = unwrapDatetimeValues(val)
+		}
+		return vv
+	case []map[string]any:
+		for _, m := range vv {
+			for k, val := range m {
+				m[k] = unwrapDatetimeValues(val)
+			}
+		}
+		return vv
+	}
+	return v
 }
 
 func (md *MetaData) unifyText(data any, v encoding.TextUnmarshaler) error {
 	var s string
 	switch sdata := data.(type) {
+	case internal.DatetimeValue:
+		text, err := sdata.T.MarshalText()
+		if err != nil {
+			return err
+		}
+		s = string(text)
 	case Marshaler:
 		text, err := sdata.MarshalTOML()
 		if err != nil {
