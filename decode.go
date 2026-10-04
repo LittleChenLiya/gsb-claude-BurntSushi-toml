@@ -88,7 +88,8 @@ const (
 // TOML table arrays correspond to either a slice of structs or a slice of maps.
 //
 // TOML datetimes correspond to [time.Time]. Local datetimes are parsed in the
-// local timezone.
+// local timezone. Use the explicit [DateTime] carrier to preserve the exact
+// datetime kind, zone offset, and fractional-second precision instead.
 //
 // [time.Duration] types are treated as nanoseconds if the TOML value is an
 // integer, or they're parsed with time.ParseDuration() if they're strings.
@@ -244,6 +245,21 @@ func (md *MetaData) unify(data any, rv reflect.Value) error {
 	}
 
 	rvi := rv.Interface()
+
+	// The parser carries datetimes as a datetimeValue so the explicit
+	// DateTime carrier can recover the exact offset and fractional-second
+	// precision from the original literal. Unwrap it to the default
+	// time.Time mapping for any other destination.
+	if dt, ok := data.(datetimeValue); ok {
+		typ := rv.Type()
+		if typ.Kind() == reflect.Pointer {
+			typ = typ.Elem()
+		}
+		if typ != dateTimeType {
+			data = dt.t
+		}
+	}
+
 	if v, ok := rvi.(Unmarshaler); ok {
 		err := v.UnmarshalTOML(data)
 		if err != nil {
@@ -529,8 +545,35 @@ func (md *MetaData) unifyBool(data any, rv reflect.Value) error {
 }
 
 func (md *MetaData) unifyAnything(data any, rv reflect.Value) error {
-	rv.Set(reflect.ValueOf(data))
+	rv.Set(reflect.ValueOf(unwrapDatetimeValues(data)))
 	return nil
+}
+
+// unwrapDatetimeValues recursively replaces the internal datetimeValue
+// representation with the default time.Time mapping, so that values decoded
+// into an "any" destination look exactly as they did before the DateTime
+// carrier was introduced.
+func unwrapDatetimeValues(data any) any {
+	switch v := data.(type) {
+	case datetimeValue:
+		return v.t
+	case map[string]any:
+		for k, val := range v {
+			v[k] = unwrapDatetimeValues(val)
+		}
+		return v
+	case []map[string]any:
+		for _, m := range v {
+			unwrapDatetimeValues(m)
+		}
+		return v
+	case []any:
+		for i, val := range v {
+			v[i] = unwrapDatetimeValues(val)
+		}
+		return v
+	}
+	return data
 }
 
 func (md *MetaData) unifyText(data any, v encoding.TextUnmarshaler) error {

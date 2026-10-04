@@ -373,7 +373,11 @@ func (p *parser) valueDatetime(it item) (any, tomlType) {
 	if !ok {
 		p.panicErr(it, errParseDate{it.val})
 	}
-	return t, p.typeOfPrimitive(it)
+	// Keep the normalized literal next to the time.Time so that the
+	// explicit DateTime carrier can recover the exact offset and
+	// fractional-second precision; anything decoding into any other type
+	// still gets the plain time.Time (see MetaData.unify).
+	return datetimeValue{t: t, raw: it.val}, p.typeOfPrimitive(it)
 }
 
 // Go's time.Parse() will accept numbers without a leading zero; there isn't any

@@ -94,7 +94,8 @@ func Marshal(v any) ([]byte, error) {
 // for [Decode].
 //
 // time.Time is encoded as a RFC 3339 string, and time.Duration as its string
-// representation.
+// representation. Use the explicit [DateTime] carrier to emit any of the four
+// TOML datetime types with an exact offset and fractional-second precision.
 //
 // The [Marshaler] and [encoding.TextMarshaler] interfaces are supported to
 // encoding the value as custom TOML.
@@ -172,6 +173,9 @@ func (enc *Encoder) encode(key Key, rv reflect.Value) {
 	case isMarshaler(rv):
 		enc.writeKeyValue(key, rv, false)
 		return
+	case rv.Type() == datetimeValueType: // Internal representation; e.g. from a Primitive.
+		enc.encode(key, reflect.ValueOf(rv.Interface().(datetimeValue).t))
+		return
 	case rv.Type() == primitiveType: // TODO: #76 would make this superfluous after implemented.
 		enc.encode(key, reflect.ValueOf(rv.Interface().(Primitive).undecoded))
 		return
@@ -216,6 +220,9 @@ func (enc *Encoder) encode(key Key, rv reflect.Value) {
 // eElement encodes any value that can be an array element.
 func (enc *Encoder) eElement(rv reflect.Value) {
 	switch v := rv.Interface().(type) {
+	case datetimeValue: // Internal representation; e.g. from a Primitive.
+		enc.eElement(reflect.ValueOf(v.t))
+		return
 	case time.Time: // Using TextMarshaler adds extra quotes, which we don't want.
 		format := time.RFC3339Nano
 		switch v.Location() {
@@ -567,7 +574,7 @@ func tomlTypeOfGo(rv reflect.Value) tomlType {
 	}
 
 	if rv.Kind() == reflect.Struct {
-		if rv.Type() == timeType {
+		if rv.Type() == timeType || rv.Type() == datetimeValueType {
 			return tomlDatetime
 		}
 		if isMarshaler(rv) {
