@@ -17,6 +17,8 @@ type MetaData struct {
 	keys    []Key
 	decoded map[string]struct{}
 	data    []byte // Input file; for errors.
+
+	kept map[string]any // Sidecar tree of unknown keys kept by a DecodePolicy.
 }
 
 // IsDefined reports if the key exists in the TOML data.
@@ -79,6 +81,9 @@ func (md *MetaData) Keys() []Key {
 //
 // In this sense, the Undecoded keys correspond to keys in the TOML document
 // that do not have a concrete type in your representation.
+//
+// Unknown keys kept by a [DecodePolicy] (see [Decoder.Policy]) are considered
+// handled and are not included; use [MetaData.Kept] to access them.
 func (md *MetaData) Undecoded() []Key {
 	undecoded := make([]Key, 0, len(md.keys))
 	for _, key := range md.keys {
@@ -87,6 +92,21 @@ func (md *MetaData) Undecoded() []Key {
 		}
 	}
 	return undecoded
+}
+
+// Kept returns the sidecar tree of unknown keys kept by a [DecodePolicy] with
+// the [KeepUnknown] action (see [Decoder.Policy]).
+//
+// The tree mirrors the structure of the TOML document: a kept key "server.x"
+// is stored as Kept()["server"].(map[string]any)["x"]. Values keep their TOML
+// types: int64, float64, string, bool, time.Time, map[string]any, or []any.
+// For a key kept below an array of tables, the value is a []any with the
+// matching value from every table in the array.
+//
+// Kept values are never written to the decode target. Returns nil when no
+// keys were kept.
+func (md *MetaData) Kept() map[string]any {
+	return md.kept
 }
 
 // Key represents any TOML key, including key groups. Use [MetaData.Keys] to get

@@ -113,13 +113,15 @@ const (
 // exist TOML values that cannot be placed into your representation, and there
 // may be parts of your representation that do not correspond to TOML values.
 // This loose mapping can be made stricter by using the IsDefined and/or
-// Undecoded methods on the MetaData returned.
+// Undecoded methods on the MetaData returned, or by setting a [DecodePolicy]
+// with [Decoder.Policy] to keep or reject unknown keys per key path.
 //
 // This decoder does not handle cyclic types. Decode will not terminate if a
 // cyclic type is passed.
 type Decoder struct {
 	r        io.Reader
 	maxDepth int
+	policy   DecodePolicy
 }
 
 // NewDecoder creates a new Decoder.
@@ -184,7 +186,26 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		context: nil,
 		data:    data,
 	}
-	return md, md.unify(p.mapping, rv)
+
+	// When the policy can reject unknown keys, decode into a temporary value
+	// first so the target is not delivered (even partially) when the policy
+	// rejects the document.
+	if dec.policy.rejects() {
+		tmp := indirect(reflect.New(rv.Type()).Elem())
+		if err := md.unify(p.mapping, tmp); err != nil {
+			return md, err
+		}
+		if err := md.applyPolicy(dec.policy); err != nil {
+			return md, err
+		}
+		rv.Set(tmp)
+		return md, nil
+	}
+
+	if err := md.unify(p.mapping, rv); err != nil {
+		return md, err
+	}
+	return md, md.applyPolicy(dec.policy)
 }
 
 // PrimitiveDecode is just like the other Decode* functions, except it decodes a
