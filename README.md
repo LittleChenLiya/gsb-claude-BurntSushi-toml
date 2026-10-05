@@ -5,6 +5,11 @@ Compatible with TOML version [v1.1.0](https://toml.io/en/v1.1.0).
 
 Documentation: https://pkg.go.dev/github.com/BurntSushi/toml
 
+A companion subpackage `arraymerge` merges baseline/override configurations
+with identity-keyed array-of-tables semantics (order-preserving merge, explicit
+delete-ID lists, full validation before producing a result); see
+[arraymerge/README.md](arraymerge/README.md).
+
 See the [releases page](https://github.com/BurntSushi/toml/releases) for a
 changelog; this information is also in the git tag annotations (e.g. `git show
 v0.4.0`).
