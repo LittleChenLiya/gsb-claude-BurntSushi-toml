@@ -118,8 +118,9 @@ const (
 // This decoder does not handle cyclic types. Decode will not terminate if a
 // cyclic type is passed.
 type Decoder struct {
-	r        io.Reader
-	maxDepth int
+	r               io.Reader
+	maxDepth        int
+	unknownStrategy *UnknownKeyStrategy
 }
 
 // NewDecoder creates a new Decoder.
@@ -132,6 +133,21 @@ func NewDecoder(r io.Reader) *Decoder {
 //
 // The default is 128. Set to <=0 to disable the limit.
 func (dec *Decoder) MaxDepth(l int) { dec.maxDepth = l }
+
+// SetUnknownKeyStrategy sets the strategy that determines how unknown keys are
+// handled during decoding.
+//
+// The strategy is consulted for every key that has no corresponding field in
+// the target struct and is not consumed by a map, a [Primitive], or a custom
+// decoder. By default (and when no strategy is set) unknown keys are ignored,
+// preserving the historical loose mapping. See [UnknownKeyStrategy] for the
+// available policies and how to set per-path rules.
+//
+// The decoder is returned to allow chaining.
+func (dec *Decoder) SetUnknownKeyStrategy(s *UnknownKeyStrategy) *Decoder {
+	dec.unknownStrategy = s
+	return dec
+}
 
 var (
 	unmarshalToml = reflect.TypeOf((*Unmarshaler)(nil)).Elem()
@@ -183,8 +199,15 @@ func (dec *Decoder) Decode(v any) (MetaData, error) {
 		decoded: make(map[string]struct{}, len(p.ordered)),
 		context: nil,
 		data:    data,
+		unknown: dec.unknownStrategy,
 	}
-	return md, md.unify(p.mapping, rv)
+	if err := md.unify(p.mapping, rv); err != nil {
+		return md, err
+	}
+	if len(md.rejected) > 0 {
+		return md, &UnknownKeyError{Keys: md.rejected}
+	}
+	return md, nil
 }
 
 // PrimitiveDecode is just like the other Decode* functions, except it decodes a
@@ -342,9 +365,61 @@ func (md *MetaData) unifyStruct(mapping any, rv reflect.Value) error {
 			} else if f.name != "" {
 				return md.e("cannot write unexported field %s.%s", rv.Type().String(), f.name)
 			}
+		} else {
+			// No field matches this key: it is unknown to the target struct.
+			// Apply the configured strategy (reject/retain/ignore).
+			md.checkUnknownKey(md.context.add(key), datum)
 		}
 	}
 	return nil
+}
+
+// checkUnknownKey applies the unknown-key strategy to a key that has no
+// corresponding field in the target struct.
+//
+// The path is the structural path of the key (following field aliases and
+// nested tables), not the Go field name. A quoted key containing a literal dot
+// is a single path element.
+func (md *MetaData) checkUnknownKey(path Key, value any) {
+	if md.unknown == nil {
+		return
+	}
+	switch md.unknown.policyFor(path) {
+	case UnknownKeyReject:
+		md.rejected = append(md.rejected, path)
+	case UnknownKeyRetain:
+		md.retainValue(path, value)
+	}
+}
+
+// retainValue stores a retained unknown key/value in the independent bypass
+// tree. The value keeps its TOML type and is never written into the target
+// structure.
+func (md *MetaData) retainValue(path Key, value any) {
+	if md.retained == nil {
+		md.retained = make(map[string]any)
+	}
+	setPath(md.retained, path, value)
+}
+
+// setPath sets value at the given key path in the tree, creating intermediate
+// tables as needed. A quoted key containing a literal dot is a single path
+// element.
+func setPath(tree map[string]any, path Key, value any) {
+	if len(path) == 0 {
+		return
+	}
+	if len(path) == 1 {
+		tree[path[0]] = value
+		return
+	}
+	head := path[0]
+	child, _ := tree[head].(map[string]any)
+	if child == nil {
+		child = make(map[string]any)
+		tree[head] = child
+	}
+	setPath(child, path[1:], value)
 }
 
 func (md *MetaData) unifyMap(mapping any, rv reflect.Value) error {
@@ -530,7 +605,29 @@ func (md *MetaData) unifyBool(data any, rv reflect.Value) error {
 
 func (md *MetaData) unifyAnything(data any, rv reflect.Value) error {
 	rv.Set(reflect.ValueOf(data))
+	// Decoding into an empty interface decodes no keys into a concrete type,
+	// so every key is unknown. Apply the configured strategy.
+	if md.unknown != nil {
+		md.checkUnknownKeysIn(data)
+	}
 	return nil
+}
+
+// checkUnknownKeysIn applies the unknown-key strategy to every key in the
+// given value, which is expected to be a table or an array of tables.
+func (md *MetaData) checkUnknownKeysIn(data any) {
+	switch t := data.(type) {
+	case map[string]any:
+		for key, value := range t {
+			md.checkUnknownKey(md.context.add(key), value)
+		}
+	case []map[string]any:
+		for _, tmap := range t {
+			for key, value := range tmap {
+				md.checkUnknownKey(md.context.add(key), value)
+			}
+		}
+	}
 }
 
 func (md *MetaData) unifyText(data any, v encoding.TextUnmarshaler) error {

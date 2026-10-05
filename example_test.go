@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/mail"
+	"strings"
 	"time"
 
 	"github.com/BurntSushi/toml"
@@ -384,4 +385,42 @@ func Example_unmarshalTOML() {
 	for _, part := range o.parts {
 		fmt.Println(part.Name())
 	}
+}
+
+// ExampleDecoder_SetUnknownKeyStrategy demonstrates how to use an explicit
+// unknown-key strategy to reject top-level unknown keys while retaining
+// unknown keys inside the [server] table in a separate bypass tree.
+func ExampleDecoder_SetUnknownKeyStrategy() {
+	type server struct {
+		Host string `toml:"host"`
+	}
+	type config struct {
+		Server server `toml:"server"`
+	}
+
+	blob := `
+unknown_top = "rejected"
+
+[server]
+host = "localhost"
+x = "retained"
+`
+	dec := toml.NewDecoder(strings.NewReader(blob))
+	dec.SetUnknownKeyStrategy(
+		toml.NewUnknownKeyStrategy(toml.UnknownKeyReject).
+			RetainAt("server"),
+	)
+
+	var cfg config
+	md, err := dec.Decode(&cfg)
+	if err != nil {
+		fmt.Println("error:", err)
+	}
+	fmt.Println("host:", cfg.Server.Host)
+	fmt.Println("retained server.x:", md.Retained()["server"].(map[string]any)["x"])
+
+	// Output:
+	// error: toml: unknown keys rejected: unknown_top
+	// host: localhost
+	// retained server.x: retained
 }

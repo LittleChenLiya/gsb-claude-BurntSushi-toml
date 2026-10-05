@@ -17,6 +17,19 @@ type MetaData struct {
 	keys    []Key
 	decoded map[string]struct{}
 	data    []byte // Input file; for errors.
+
+	// unknown is the strategy applied to keys that have no corresponding field
+	// in the target struct. It is nil when no strategy was set, in which case
+	// unknown keys are ignored (the historical default).
+	unknown *UnknownKeyStrategy
+
+	// rejected collects the paths of keys that were rejected by the
+	// UnknownKeyReject policy, in document order.
+	rejected []Key
+
+	// retained is the independent bypass tree of keys that were retained by the
+	// UnknownKeyRetain policy. It is nil if no keys were retained.
+	retained map[string]any
 }
 
 // IsDefined reports if the key exists in the TOML data.
@@ -87,6 +100,17 @@ func (md *MetaData) Undecoded() []Key {
 		}
 	}
 	return undecoded
+}
+
+// Retained returns the independent bypass tree of unknown keys that were
+// retained by the [UnknownKeyRetain] policy.
+//
+// The tree mirrors the structure of the TOML document: each table is a
+// map[string]any and the leaves keep their TOML types (string, int64, float64,
+// bool, time.Time, []any, or map[string]any). The retained values are never
+// written into the target structure. Returns nil if no keys were retained.
+func (md *MetaData) Retained() map[string]any {
+	return md.retained
 }
 
 // Key represents any TOML key, including key groups. Use [MetaData.Keys] to get
