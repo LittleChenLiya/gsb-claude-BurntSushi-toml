@@ -118,3 +118,56 @@ a similar way.
 
 ### More complex usage
 See the [`_example/`](/_example) directory for a more complex example.
+
+### Merging arrays of tables
+
+`MergeArrayTables` merges an override configuration into a baseline by
+matching items in an array of tables on a declared identity field. Baseline
+items keep their order; new items are appended at the end. Items with the
+same identity are merged recursively (nested tables merge key-by-key; arrays
+and scalar values are replaced wholesale).
+
+```go
+baseline := map[string]any{
+	"services": []any{
+		map[string]any{"id": "a", "port": 1},
+		map[string]any{"id": "b", "port": 2},
+	},
+}
+override := map[string]any{
+	"services": []any{
+		map[string]any{"id": "b", "port": 20}, // overrides b
+		map[string]any{"id": "c", "port": 3},  // appended
+	},
+}
+opts := toml.MergeOptions{ArrayKey: "services", IdentityField: "id"}
+merged, err := toml.MergeArrayTables(baseline, override, opts)
+// merged["services"] order: a, b, c; b's port is 20
+```
+
+Deletion is performed only through an explicit delete ID list; an empty
+table is never interpreted as a deletion. Unknown IDs in the delete list
+are an error. The baseline and override maps (and their maps and slices) are
+never modified — a new map is returned that shares no mutable state with
+either input. No result is returned unless every validation check passes.
+
+```go
+override := map[string]any{
+	"delete":   []any{"a"},
+	"services": []any{
+		map[string]any{"id": "b", "port": 20},
+		map[string]any{"id": "c", "port": 3},
+	},
+}
+opts := toml.MergeOptions{
+	ArrayKey:      "services",
+	IdentityField: "id",
+	DeleteField:   "delete",
+}
+merged, err := toml.MergeArrayTables(baseline, override, opts)
+// merged["services"] order: b, c (a was deleted)
+```
+
+Run the merge tests with:
+
+    % go test -run TestMergeArrayTables ./...
